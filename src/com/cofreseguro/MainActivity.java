@@ -690,9 +690,8 @@ public class MainActivity extends android.app.Activity {
         if (!vaultReady()) {
             return;
         }
-        entry.accessCount++;
         try {
-            store.save();
+            store.recordAccess(entry);
         } catch (Exception error) {
             showError("Não foi possível registrar o acesso", error);
         }
@@ -822,17 +821,18 @@ public class MainActivity extends android.app.Activity {
                             site.requestFocus();
                             return;
                         }
-                        if (creating) {
-                            store.getEntries().add(new VaultEntry(siteText,
-                                    username.getText().toString(), password.getText().toString()));
-                        } else {
-                            entry.site = siteText;
-                            entry.username = username.getText().toString();
-                            entry.password = password.getText().toString();
-                            entry.updatedAt = System.currentTimeMillis();
-                        }
                         try {
-                            store.save();
+                            if (creating) {
+                                store.add(new VaultEntry(siteText,
+                                        username.getText().toString(), password.getText().toString()));
+                            } else {
+                                VaultEntry values = entry.copy();
+                                values.site = siteText;
+                                values.username = username.getText().toString();
+                                values.password = password.getText().toString();
+                                values.updatedAt = System.currentTimeMillis();
+                                store.update(entry, values);
+                            }
                             renderVault();
                             shown.dismiss();
                             Toast.makeText(MainActivity.this, "Registro salvo", Toast.LENGTH_SHORT).show();
@@ -863,9 +863,8 @@ public class MainActivity extends android.app.Activity {
                         if (!vaultReady()) {
                             return;
                         }
-                        store.getEntries().remove(entry);
                         try {
-                            store.save();
+                            store.remove(entry);
                             renderVault();
                             if (entryDialog != null) {
                                 entryDialog.dismiss();
