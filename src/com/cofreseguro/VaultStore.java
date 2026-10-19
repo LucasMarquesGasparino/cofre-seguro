@@ -22,6 +22,7 @@ final class VaultStore {
     private final File vaultFile;
     private final CryptoStore crypto;
     private final ArrayList<VaultEntry> entries = new ArrayList<>();
+    private boolean loaded;
 
     VaultStore(Context context) {
         Context appContext = context.getApplicationContext();
@@ -31,24 +32,31 @@ final class VaultStore {
 
     void load() throws Exception {
         entries.clear();
-        if (!vaultFile.exists()) {
-            return;
+        loaded = false;
+        if (vaultFile.exists()) {
+            String clearText = crypto.decrypt(readFile(vaultFile));
+            JSONObject root = new JSONObject(clearText);
+            if (root.optInt("version", 1) != 1) {
+                throw new SecurityException("Versão de cofre não suportada");
+            }
+            JSONArray array = root.optJSONArray("entries");
+            if (array != null) {
+                for (int i = 0; i < array.length(); i++) {
+                    entries.add(VaultEntry.fromJson(array.getJSONObject(i)));
+                }
+            }
         }
-        String clearText = crypto.decrypt(readFile(vaultFile));
-        JSONObject root = new JSONObject(clearText);
-        if (root.optInt("version", 1) != 1) {
-            throw new SecurityException("Versão de cofre não suportada");
-        }
-        JSONArray array = root.optJSONArray("entries");
-        if (array == null) {
-            return;
-        }
-        for (int i = 0; i < array.length(); i++) {
-            entries.add(VaultEntry.fromJson(array.getJSONObject(i)));
-        }
+        loaded = true;
+    }
+
+    boolean isLoaded() {
+        return loaded;
     }
 
     void save() throws Exception {
+        if (!loaded) {
+            throw new IllegalStateException("A bolsa não está aberta");
+        }
         JSONObject root = new JSONObject();
         root.put("version", 1);
         root.put("updatedAt", System.currentTimeMillis());
@@ -66,6 +74,7 @@ final class VaultStore {
 
     void clearMemory() {
         entries.clear();
+        loaded = false;
     }
 
     void exportTo(ContentResolver resolver, Uri destination) throws Exception {

@@ -1,7 +1,10 @@
 package com.cofreseguro;
 
 import android.app.AlertDialog;
+import android.app.Dialog;
 import android.app.KeyguardManager;
+import android.content.DialogInterface;
+import android.hardware.biometrics.BiometricManager;
 import android.hardware.biometrics.BiometricPrompt;
 import android.content.ClipData;
 import android.content.ClipboardManager;
@@ -13,7 +16,9 @@ import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.CancellationSignal;
 import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputType;
@@ -21,6 +26,7 @@ import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.view.Window;
+import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
@@ -28,6 +34,7 @@ import android.widget.AutoCompleteTextView;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Spinner;
@@ -53,12 +60,21 @@ public class MainActivity extends android.app.Activity {
     private static final int SORT_ACCESS = 1;
     private static final int SORT_DUPLICATES = 2;
     private static final int SORT_UPDATED = 3;
+    private static final int BIOMETRIC_ERROR_LOCKOUT = 7;
+    private static final int BIOMETRIC_ERROR_HW_UNAVAILABLE = 1;
+    private static final int BIOMETRIC_ERROR_NO_BIOMETRICS = 11;
+    private static final int BIOMETRIC_ERROR_HW_NOT_PRESENT = 12;
+    private static final int BIOMETRIC_ERROR_LOCKOUT_PERMANENT = 9;
+    private static final int BIOMETRIC_ERROR_NEGATIVE_BUTTON = 13;
 
-    private final Handler handler = new Handler();
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final ArrayList<Dialog> openDialogs = new ArrayList<>();
     private VaultStore store;
     private KeyguardManager keyguardManager;
+    private CancellationSignal cancelSignal;
 
     private FrameLayout root;
+    private ScrollView scrollView;
     private LinearLayout content;
     private LinearLayout listContainer;
     private Spinner sortSpinner;
@@ -76,30 +92,33 @@ public class MainActivity extends android.app.Activity {
     private boolean uiReady;
     private boolean passwordsVisible;
     private boolean resettingSearch;
+    private boolean autoPromptAllowed = true;
     private int sortMode = SORT_ALPHABETICAL;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        getWindow().setFlags(WindowManagerLayoutParams.FLAG_SECURE,
-                WindowManagerLayoutParams.FLAG_SECURE);
+        getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE,
+                WindowManager.LayoutParams.FLAG_SECURE);
         keyguardManager = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
         store = new VaultStore(this);
         buildUi();
         uiReady = true;
         showLocked("Bolsa bloqueada", "Desbloqueie com a biometria ou com o bloqueio de tela do aparelho.", false);
-        handler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                requestUnlock();
-            }
-        }, 300);
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        if (!authInProgress && !filePickerOpen) {
+            autoPromptAllowed = true;
+        }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (uiReady && !unlocked && !authInProgress) {
+        if (uiReady && !unlocked && !authInProgress && autoPromptAllowed) {
             handler.postDelayed(new Runnable() {
                 @Override
                 public void run() {
@@ -119,6 +138,11 @@ public class MainActivity extends android.app.Activity {
 
     @Override
     protected void onDestroy() {
+        if (cancelSignal != null) {
+            cancelSignal.cancel();
+            cancelSignal = null;
+        }
+        handler.removeCallbacksAndMessages(null);
         if (store != null) {
             store.clearMemory();
         }
@@ -129,7 +153,7 @@ public class MainActivity extends android.app.Activity {
         root = new FrameLayout(this);
         root.setBackground(magicBackground());
 
-        ScrollView scrollView = new ScrollView(this);
+        scrollView = new ScrollView(this);
         scrollView.setFillViewport(true);
         content = vertical(20);
         content.setPadding(dp(20), dp(22), dp(20), dp(28));
@@ -257,7 +281,13 @@ public class MainActivity extends android.app.Activity {
         lockedOverlay = vertical(20);
         lockedOverlay.setGravity(Gravity.CENTER);
         lockedOverlay.setPadding(dp(34), dp(30), dp(34), dp(30));
-        lockedOverlay.setBackgroundColor(Color.TRANSPARENT);
+        lockedOverlay.setBackground(magicBackground());
+        lockedOverlay.setClickable(true);
+        lockedOverlay.setFocusable(true);
+        ImageView lockIcon = new ImageView(this);
+        lockIcon.setImageResource(R.drawable.ic_magic_bag);
+        lockIcon.setContentDescription(null);
+        lockedOverlay.addView(lockIcon, new LinearLayout.LayoutParams(dp(96), dp(96)));
         lockedTitle = text("Bolsa bloqueada", 25, Color.rgb(255, 244, 211));
         lockedTitle.setGravity(Gravity.CENTER);
         lockedTitle.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
@@ -293,23 +323,27 @@ public class MainActivity extends android.app.Activity {
         if (Build.VERSION.SDK_INT >= 28) {
             try {
                 Executor executor = getMainExecutor();
+                cancelSignal = new CancellationSignal();
                 BiometricPrompt.Builder builder = new BiometricPrompt.Builder(this)
                         .setTitle("Desbloquear Bolsa da Hermione")
                         .setSubtitle("Confirme sua identidade para ver as credenciais")
                         .setDescription("A chave do cofre permanece protegida pelo Android");
-                if (Build.VERSION.SDK_INT >= 29) {
+                if (Build.VERSION.SDK_INT >= 30) {
+                    builder.setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_WEAK
+                            | BiometricManager.Authenticators.DEVICE_CREDENTIAL);
+                } else if (Build.VERSION.SDK_INT == 29) {
                     builder.setDeviceCredentialAllowed(true);
                 } else {
                     builder.setNegativeButton("Usar PIN ou padrão", executor,
-                            new android.content.DialogInterface.OnClickListener() {
+                            new DialogInterface.OnClickListener() {
                                 @Override
-                                public void onClick(android.content.DialogInterface dialog, int which) {
+                                public void onClick(DialogInterface dialog, int which) {
                                     launchDeviceCredential();
                                 }
                             });
                 }
                 BiometricPrompt prompt = builder.build();
-                prompt.authenticate(null, executor, new BiometricPrompt.AuthenticationCallback() {
+                prompt.authenticate(cancelSignal, executor, new BiometricPrompt.AuthenticationCallback() {
                     @Override
                     public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
                         super.onAuthenticationSucceeded(result);
@@ -319,8 +353,21 @@ public class MainActivity extends android.app.Activity {
                     @Override
                     public void onAuthenticationError(int errorCode, CharSequence errString) {
                         super.onAuthenticationError(errorCode, errString);
+                        if (errorCode == BIOMETRIC_ERROR_NEGATIVE_BUTTON) {
+                            return;
+                        }
                         authInProgress = false;
-                        showLocked("Bolsa bloqueada", "Toque no botão para tentar novamente.", false);
+                        cancelSignal = null;
+                        if (errorCode == BIOMETRIC_ERROR_HW_UNAVAILABLE
+                                || errorCode == BIOMETRIC_ERROR_NO_BIOMETRICS
+                                || errorCode == BIOMETRIC_ERROR_HW_NOT_PRESENT
+                                || errorCode == BIOMETRIC_ERROR_LOCKOUT
+                                || errorCode == BIOMETRIC_ERROR_LOCKOUT_PERMANENT) {
+                            launchDeviceCredential();
+                        } else {
+                            autoPromptAllowed = false;
+                            showLocked("Bolsa bloqueada", "Toque em Desbloquear para tentar de novo.", false);
+                        }
                     }
 
                     @Override
@@ -330,6 +377,7 @@ public class MainActivity extends android.app.Activity {
                     }
                 });
             } catch (RuntimeException error) {
+                cancelSignal = null;
                 launchDeviceCredential();
             }
         } else {
@@ -345,14 +393,17 @@ public class MainActivity extends android.app.Activity {
             showSecuritySetup();
             return;
         }
+        authInProgress = true;
         startActivityForResult(intent, REQUEST_CREDENTIAL);
     }
 
     private void unlockAndLoad() {
         authInProgress = false;
+        cancelSignal = null;
         try {
             store.load();
             unlocked = true;
+            scrollView.setVisibility(View.VISIBLE);
             lockedOverlay.setVisibility(View.GONE);
             sortSpinner.setEnabled(true);
             renderVault();
@@ -367,6 +418,7 @@ public class MainActivity extends android.app.Activity {
     private void lockAndHide() {
         unlocked = false;
         passwordsVisible = false;
+        dismissAllDialogs();
         if (searchField != null) {
             resettingSearch = true;
             searchField.setText("");
@@ -412,7 +464,43 @@ public class MainActivity extends android.app.Activity {
                 }
             }
         });
+        scrollView.setVisibility(View.INVISIBLE);
         lockedOverlay.setVisibility(View.VISIBLE);
+    }
+
+    private boolean vaultReady() {
+        return unlocked && store != null && store.isLoaded();
+    }
+
+    private void secure(final Dialog dialog) {
+        Window window = dialog.getWindow();
+        if (window != null) {
+            window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE);
+        }
+        openDialogs.add(dialog);
+        dialog.setOnDismissListener(new DialogInterface.OnDismissListener() {
+            @Override
+            public void onDismiss(DialogInterface dismissed) {
+                openDialogs.remove(dialog);
+            }
+        });
+    }
+
+    private void dismissAllDialogs() {
+        for (Dialog dialog : new ArrayList<>(openDialogs)) {
+            dialog.dismiss();
+        }
+        openDialogs.clear();
+    }
+
+    private void showMessage(String title, String message) {
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage(message)
+                .setPositiveButton("OK", null)
+                .create();
+        secure(dialog);
+        dialog.show();
     }
 
     private void renderVault() {
@@ -599,6 +687,9 @@ public class MainActivity extends android.app.Activity {
     }
 
     private void openEntry(final VaultEntry entry) {
+        if (!vaultReady()) {
+            return;
+        }
         entry.accessCount++;
         try {
             store.save();
@@ -688,10 +779,14 @@ public class MainActivity extends android.app.Activity {
                 }
             }
         });
+        secure(dialog);
         dialog.show();
     }
 
     private void showEntryEditor(final VaultEntry entry) {
+        if (!vaultReady()) {
+            return;
+        }
         final boolean creating = entry == null;
         final LinearLayout form = vertical(8);
         final EditText site = editField("Nome do site ou serviço", creating ? "" : entry.site, false);
@@ -717,6 +812,10 @@ public class MainActivity extends android.app.Activity {
                 shown.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
                     @Override
                     public void onClick(View view) {
+                        if (!vaultReady()) {
+                            shown.dismiss();
+                            return;
+                        }
                         String siteText = site.getText().toString().trim();
                         if (siteText.length() == 0) {
                             site.setError("Informe o site ou serviço");
@@ -746,17 +845,24 @@ public class MainActivity extends android.app.Activity {
                 shown.getWindow().setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
             }
         });
+        secure(dialog);
         dialog.show();
     }
 
     private void confirmDelete(final VaultEntry entry, final AlertDialog entryDialog) {
-        new AlertDialog.Builder(this)
+        if (!vaultReady()) {
+            return;
+        }
+        AlertDialog confirm = new AlertDialog.Builder(this)
                 .setTitle("Apagar registro?")
                 .setMessage("O acesso de “" + entry.site + "” será removido do cofre.")
                 .setNegativeButton("Cancelar", null)
-                .setPositiveButton("Apagar", new android.content.DialogInterface.OnClickListener() {
+                .setPositiveButton("Apagar", new DialogInterface.OnClickListener() {
                     @Override
-                    public void onClick(android.content.DialogInterface dialog, int which) {
+                    public void onClick(DialogInterface dialog, int which) {
+                        if (!vaultReady()) {
+                            return;
+                        }
                         store.getEntries().remove(entry);
                         try {
                             store.save();
@@ -769,10 +875,15 @@ public class MainActivity extends android.app.Activity {
                             showError("Falha ao apagar o registro", error);
                         }
                     }
-                }).show();
+                }).create();
+        secure(confirm);
+        confirm.show();
     }
 
     private void exportVault() {
+        if (!vaultReady()) {
+            return;
+        }
         try {
             store.save();
             Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
@@ -786,6 +897,9 @@ public class MainActivity extends android.app.Activity {
     }
 
     private void importVault() {
+        if (!vaultReady()) {
+            return;
+        }
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.setType("application/json");
         intent.addCategory(Intent.CATEGORY_OPENABLE);
@@ -801,13 +915,14 @@ public class MainActivity extends android.app.Activity {
             if (resultCode == RESULT_OK) {
                 unlockAndLoad();
             } else {
-                showLocked("Bolsa bloqueada", "Toque no botão para tentar novamente.", false);
+                autoPromptAllowed = false;
+                showLocked("Bolsa bloqueada", "Toque em Desbloquear para tentar de novo.", false);
             }
             return;
         }
         if (requestCode == REQUEST_EXPORT || requestCode == REQUEST_IMPORT) {
             filePickerOpen = false;
-            if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+            if (resultCode == RESULT_OK && data != null && data.getData() != null && vaultReady()) {
                 try {
                     if (requestCode == REQUEST_EXPORT) {
                         store.exportTo(getContentResolver(), data.getData());
@@ -816,17 +931,14 @@ public class MainActivity extends android.app.Activity {
                         store.importFrom(getContentResolver(), data.getData());
                         Toast.makeText(this, "Backup criptografado importado", Toast.LENGTH_LONG).show();
                     }
+                    renderVault();
                 } catch (Exception error) {
                     showError("Falha no backup criptografado", error);
                 }
+            } else if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+                Toast.makeText(this, "A bolsa foi bloqueada durante a operação. Desbloqueie e repita.",
+                        Toast.LENGTH_LONG).show();
             }
-            lockAndHide();
-            handler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    requestUnlock();
-                }
-            }, 300);
         }
     }
 
@@ -856,11 +968,7 @@ public class MainActivity extends android.app.Activity {
         if (detail == null || detail.length() == 0) {
             detail = "Verifique o armazenamento e tente novamente.";
         }
-        new AlertDialog.Builder(this)
-                .setTitle(title)
-                .setMessage(detail)
-                .setPositiveButton("OK", null)
-                .show();
+        showMessage(title, detail);
     }
 
     private EditText editField(String hint, String value, boolean password) {
@@ -1036,7 +1144,4 @@ public class MainActivity extends android.app.Activity {
         }
     }
 
-    private static final class WindowManagerLayoutParams {
-        static final int FLAG_SECURE = 8192;
-    }
 }
