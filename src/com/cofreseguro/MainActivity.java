@@ -14,6 +14,7 @@ import android.content.IntentFilter;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
+import android.graphics.Insets;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
@@ -31,6 +32,7 @@ import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.view.Window;
+import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
@@ -42,6 +44,7 @@ import android.widget.CompoundButton;
 import android.widget.ProgressBar;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
+import android.widget.SeekBar;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -66,9 +69,11 @@ import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.ArrayList;
+import java.security.SecureRandom;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -131,6 +136,8 @@ public class MainActivity extends android.app.Activity {
     private long backgroundedAt;
     private String clipboardText;
     private BroadcastReceiver screenOffReceiver;
+    private final HashMap<String, Integer> passwordCounts = new HashMap<>();
+    private TextView healthLabel;
 
     private static final long IDLE_LOCK_MS = 5 * 60 * 1000L;
     private static final long FILE_PICKER_LOCK_MS = 5 * 60 * 1000L;
@@ -162,6 +169,7 @@ public class MainActivity extends android.app.Activity {
                 WindowManager.LayoutParams.FLAG_SECURE);
         keyguardManager = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
         prefs = getSharedPreferences("prefs", MODE_PRIVATE);
+        sortMode = prefs.getInt("sortMode", SORT_ALPHABETICAL);
         screenOffReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
@@ -302,6 +310,21 @@ public class MainActivity extends android.app.Activity {
         root = new FrameLayout(this);
         root.setBackground(magicBackground());
         root.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
+        root.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
+            @Override
+            public WindowInsets onApplyWindowInsets(View view, WindowInsets insets) {
+                if (Build.VERSION.SDK_INT >= 30) {
+                    Insets bars = insets.getInsets(
+                            WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                    view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+                    return WindowInsets.CONSUMED;
+                }
+                view.setPadding(insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetTop(),
+                        insets.getSystemWindowInsetRight(), insets.getSystemWindowInsetBottom());
+                return insets.consumeSystemWindowInsets();
+            }
+        });
+        root.requestApplyInsets();
 
         scrollView = new ScrollView(this);
         scrollView.setFillViewport(true);
@@ -315,11 +338,15 @@ public class MainActivity extends android.app.Activity {
         LinearLayout header = horizontal(0);
         header.setGravity(Gravity.CENTER_VERTICAL);
         TextView sigil = text("✦", 25, Color.rgb(255, 215, 112));
+        sigil.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         sigil.setGravity(Gravity.CENTER);
         header.addView(sigil, new LinearLayout.LayoutParams(dp(30), -2));
         LinearLayout titleBlock = vertical(0);
         TextView title = text("Bolsa da Hermione", 27, Color.rgb(255, 244, 211));
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        if (Build.VERSION.SDK_INT >= 28) {
+            title.setAccessibilityHeading(true);
+        }
         titleBlock.addView(title);
         TextView subtitle = text("Suas credenciais, protegidas no aparelho", 14, Color.rgb(214, 204, 241));
         titleBlock.addView(subtitle, marginParams(0, 4, 0, 0));
@@ -417,6 +444,7 @@ public class MainActivity extends android.app.Activity {
             @Override
             public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
                 sortMode = position;
+                prefs.edit().putInt("sortMode", position).apply();
                 if (unlocked) {
                     renderVault();
                 }
@@ -426,8 +454,13 @@ public class MainActivity extends android.app.Activity {
             public void onNothingSelected(AdapterView<?> parent) {
             }
         });
+        sortSpinner.setContentDescription("Ordenar registros");
+        sortSpinner.setSelection(sortMode);
         listHeader.addView(sortSpinner, new LinearLayout.LayoutParams(dp(170), dp(48)));
         content.addView(listHeader, marginParams(0, 25, 0, 0));
+        healthLabel = text("", 13, Color.rgb(255, 207, 101));
+        healthLabel.setVisibility(View.GONE);
+        content.addView(healthLabel, marginParams(0, 6, 0, 0));
 
         searchField = editField("Buscar site, usuário ou senha", "", false);
         searchField.setTextColor(Color.rgb(35, 25, 65));
@@ -747,6 +780,7 @@ public class MainActivity extends android.app.Activity {
         listContainer.removeAllViews();
         updateReminder();
         ArrayList<VaultEntry> allEntries = new ArrayList<>(store.getEntries());
+        computeHealth(allEntries);
         updateSearchVisibility(allEntries.size());
         String query = searchField == null ? "" : searchField.getText().toString().trim();
         ArrayList<VaultEntry> entries = filterEntries(allEntries, query);
@@ -771,30 +805,7 @@ public class MainActivity extends android.app.Activity {
         if (sortMode == SORT_DUPLICATES) {
             renderGrouped(entries);
         } else {
-            if (sortMode == SORT_ACCESS) {
-                Collections.sort(entries, new Comparator<VaultEntry>() {
-                    @Override
-                    public int compare(VaultEntry left, VaultEntry right) {
-                        int count = Integer.compare(right.accessCount, left.accessCount);
-                        return count != 0 ? count : left.site.compareToIgnoreCase(right.site);
-                    }
-                });
-            } else if (sortMode == SORT_UPDATED) {
-                Collections.sort(entries, new Comparator<VaultEntry>() {
-                    @Override
-                    public int compare(VaultEntry left, VaultEntry right) {
-                        int updated = Long.compare(right.updatedAt, left.updatedAt);
-                        return updated != 0 ? updated : left.site.compareToIgnoreCase(right.site);
-                    }
-                });
-            } else {
-                Collections.sort(entries, new Comparator<VaultEntry>() {
-                    @Override
-                    public int compare(VaultEntry left, VaultEntry right) {
-                        return left.site.compareToIgnoreCase(right.site);
-                    }
-                });
-            }
+            Collections.sort(entries, comparatorFor(sortMode));
             for (VaultEntry entry : entries) {
                 listContainer.addView(entryCard(entry));
             }
@@ -827,7 +838,8 @@ public class MainActivity extends android.app.Activity {
         for (VaultEntry entry : source) {
             if (contains(entry.site, normalizedQuery)
                     || contains(entry.username, normalizedQuery)
-                    || contains(entry.password, normalizedQuery)) {
+                    || contains(entry.password, normalizedQuery)
+                    || contains(entry.notes, normalizedQuery)) {
                 filtered.add(entry);
             }
         }
@@ -893,7 +905,7 @@ public class MainActivity extends android.app.Activity {
         card.setElevation(dp(2));
 
         LinearLayout information = vertical(0);
-        TextView site = text(entry.site, 17, Color.rgb(255, 241, 188));
+        TextView site = text((entry.favorite ? "★ " : "") + entry.site, 17, Color.rgb(255, 241, 188));
         site.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         information.addView(site);
         String secondary = entry.username.length() == 0 ? "Usuário não informado" : entry.username;
@@ -911,11 +923,27 @@ public class MainActivity extends android.app.Activity {
             password.setEllipsize(android.text.TextUtils.TruncateAt.END);
             information.addView(password, marginParams(0, 4, 0, 0));
         }
+        LinearLayout badges = horizontal(6);
+        if (isRepeated(entry)) {
+            badges.addView(badge("Senha repetida"));
+        }
+        if (isWeak(entry)) {
+            badges.addView(badge("Senha fraca"));
+        }
+        if (badges.getChildCount() > 0) {
+            information.addView(badges, marginParams(0, 6, 0, 0));
+        }
         card.addView(information, new LinearLayout.LayoutParams(0, -2, 1));
 
-        TextView arrow = text("›", 30, Color.rgb(255, 207, 101));
-        arrow.setGravity(Gravity.CENTER);
-        card.addView(arrow, new LinearLayout.LayoutParams(dp(30), dp(60)));
+        Button copy = button("Copiar", Color.rgb(39, 110, 241), Color.WHITE);
+        copy.setContentDescription("Copiar senha de " + entry.site);
+        copy.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                copyFromEntry("Senha", entry, entry.password);
+            }
+        });
+        card.addView(copy, new LinearLayout.LayoutParams(dp(84), dp(48)));
         card.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
@@ -929,12 +957,6 @@ public class MainActivity extends android.app.Activity {
         if (!vaultReady()) {
             return;
         }
-        try {
-            store.recordAccess(entry);
-        } catch (Exception error) {
-            showError("Não foi possível registrar o acesso", error);
-        }
-
         final LinearLayout body = vertical(8);
         TextView info = text("Toque em Mostrar para revelar a senha. O conteúdo fica visível somente enquanto o cofre está desbloqueado.",
                 13, Color.rgb(91, 105, 126));
@@ -968,6 +990,9 @@ public class MainActivity extends android.app.Activity {
             @Override
             public void onClick(View view) {
                 visible[0] = !visible[0];
+                if (visible[0]) {
+                    countAccess(entry);
+                }
                 password.setText(visible[0] ? (entry.password.length() == 0 ? "Não informada" : entry.password) : mask(entry.password));
                 reveal.setText(visible[0] ? "Ocultar" : "Mostrar");
             }
@@ -982,6 +1007,32 @@ public class MainActivity extends android.app.Activity {
         });
         passwordActions.addView(copyPassword, new LinearLayout.LayoutParams(0, dp(46), 1));
         body.addView(passwordActions, marginParams(0, 6, 0, 0));
+
+        body.addView(text("Força: " + PasswordStrength.label(PasswordStrength.score(entry.password)),
+                12, Color.rgb(121, 105, 153)), marginParams(0, 6, 0, 0));
+        if (entry.notes.length() > 0) {
+            TextView notesView = text(entry.notes, 14, Color.rgb(18, 32, 54));
+            notesView.setTextIsSelectable(true);
+            body.addView(notesView, marginParams(0, 14, 0, 0));
+        }
+        final Button favorite = button(entry.favorite ? "★ Remover dos favoritos" : "☆ Favoritar",
+                Color.rgb(231, 238, 250), Color.rgb(39, 82, 147));
+        favorite.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                if (!vaultReady()) {
+                    return;
+                }
+                try {
+                    store.setFavorite(entry, !entry.favorite);
+                    favorite.setText(entry.favorite ? "★ Remover dos favoritos" : "☆ Favoritar");
+                    renderVault();
+                } catch (Exception error) {
+                    showError("Não foi possível alterar o favorito", error);
+                }
+            }
+        });
+        body.addView(favorite, marginParams(0, 14, 0, 0));
 
         Button edit = button("Editar registro", Color.WHITE, Color.rgb(39, 82, 147));
         edit.setBackground(borderBackground(Color.WHITE, Color.rgb(39, 110, 241), 12));
@@ -1033,6 +1084,54 @@ public class MainActivity extends android.app.Activity {
         form.addView(site);
         form.addView(username, marginParams(0, 10, 0, 0));
         form.addView(password, marginParams(0, 10, 0, 0));
+        final TextView strengthLabel = text("", 13, Color.rgb(91, 105, 126));
+        updateStrength(strengthLabel, password.getText().toString());
+        password.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence text, int start, int count, int after) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence text, int start, int before, int count) {
+            }
+
+            @Override
+            public void afterTextChanged(Editable editable) {
+                updateStrength(strengthLabel, editable.toString());
+            }
+        });
+        LinearLayout passwordActions = horizontal(8);
+        final Button revealButton = button("Mostrar", Color.rgb(231, 238, 250), Color.rgb(39, 82, 147));
+        revealButton.setOnClickListener(new View.OnClickListener() {
+            private boolean shown;
+
+            @Override
+            public void onClick(View view) {
+                shown = !shown;
+                setPasswordVisible(password, shown);
+                revealButton.setText(shown ? "Ocultar" : "Mostrar");
+            }
+        });
+        Button generateButton = button("Gerar", Color.rgb(231, 238, 250), Color.rgb(39, 82, 147));
+        generateButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                showGenerator(password);
+            }
+        });
+        passwordActions.addView(revealButton, new LinearLayout.LayoutParams(0, dp(48), 1));
+        passwordActions.addView(generateButton, new LinearLayout.LayoutParams(0, dp(48), 1));
+        form.addView(passwordActions, marginParams(0, 6, 0, 0));
+        form.addView(strengthLabel, marginParams(0, 4, 0, 0));
+        final EditText notesField = editField("Notas (opcional)", creating ? "" : entry.notes, false);
+        notesField.setSingleLine(false);
+        notesField.setMinLines(3);
+        notesField.setMaxLines(6);
+        notesField.setGravity(Gravity.TOP);
+        notesField.setPadding(dp(14), dp(10), dp(14), dp(10));
+        notesField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        form.addView(notesField, marginParams(0, 10, 0, 0));
         TextView note = text("Os dados são gravados no armazenamento privado do app, criptografados com AES-GCM.\nNunca coloque uma senha real em uma exportação que você não reconheça.",
                 12, Color.rgb(91, 105, 126));
         form.addView(note, marginParams(0, 14, 0, 0));
@@ -1062,13 +1161,20 @@ public class MainActivity extends android.app.Activity {
                         }
                         try {
                             if (creating) {
-                                store.add(new VaultEntry(siteText,
-                                        username.getText().toString(), password.getText().toString()));
+                                if (hasSameAccount(siteText, username.getText().toString())) {
+                                    Toast.makeText(MainActivity.this,
+                                            "Já existe um registro com este site e usuário.", Toast.LENGTH_LONG).show();
+                                }
+                                VaultEntry created = new VaultEntry(siteText,
+                                        username.getText().toString(), password.getText().toString());
+                                created.notes = notesField.getText().toString();
+                                store.add(created);
                             } else {
                                 VaultEntry values = entry.copy();
                                 values.site = siteText;
                                 values.username = username.getText().toString();
                                 values.password = password.getText().toString();
+                                values.notes = notesField.getText().toString();
                                 values.updatedAt = System.currentTimeMillis();
                                 store.update(entry, values);
                             }
@@ -1079,6 +1185,31 @@ public class MainActivity extends android.app.Activity {
                         } catch (Exception error) {
                             showError("Falha ao salvar o registro", error);
                         }
+                    }
+                });
+                shown.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View view) {
+                        boolean changed = !site.getText().toString().trim().equals(creating ? "" : entry.site)
+                                || !username.getText().toString().equals(creating ? "" : entry.username)
+                                || !password.getText().toString().equals(creating ? "" : entry.password)
+                                || !notesField.getText().toString().equals(creating ? "" : entry.notes);
+                        if (!changed) {
+                            shown.dismiss();
+                            return;
+                        }
+                        AlertDialog confirm = new AlertDialog.Builder(MainActivity.this)
+                                .setTitle("Descartar alterações?")
+                                .setNegativeButton("Continuar editando", null)
+                                .setPositiveButton("Descartar", new DialogInterface.OnClickListener() {
+                                    @Override
+                                    public void onClick(DialogInterface dialogInterface, int which) {
+                                        shown.dismiss();
+                                    }
+                                })
+                                .create();
+                        secure(confirm);
+                        confirm.show();
                     }
                 });
                 site.requestFocus();
@@ -1911,6 +2042,187 @@ public class MainActivity extends android.app.Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(heightDp));
         params.setMargins(0, dp(top), 0, 0);
         return params;
+    }
+
+    private Comparator<VaultEntry> comparatorFor(final int mode) {
+        return new Comparator<VaultEntry>() {
+            @Override
+            public int compare(VaultEntry left, VaultEntry right) {
+                if (left.favorite != right.favorite) {
+                    return left.favorite ? -1 : 1;
+                }
+                if (mode == SORT_ACCESS) {
+                    int count = Integer.compare(right.accessCount, left.accessCount);
+                    if (count != 0) {
+                        return count;
+                    }
+                } else if (mode == SORT_UPDATED) {
+                    int updated = Long.compare(right.updatedAt, left.updatedAt);
+                    if (updated != 0) {
+                        return updated;
+                    }
+                }
+                return left.site.compareToIgnoreCase(right.site);
+            }
+        };
+    }
+
+    private void computeHealth(List<VaultEntry> all) {
+        passwordCounts.clear();
+        for (VaultEntry entry : all) {
+            if (entry.password.length() > 0) {
+                Integer count = passwordCounts.get(entry.password);
+                passwordCounts.put(entry.password, count == null ? 1 : count + 1);
+            }
+        }
+        int repeated = 0;
+        int weak = 0;
+        for (VaultEntry entry : all) {
+            if (isRepeated(entry)) {
+                repeated++;
+            }
+            if (isWeak(entry)) {
+                weak++;
+            }
+        }
+        if (repeated + weak == 0) {
+            healthLabel.setVisibility(View.GONE);
+            return;
+        }
+        healthLabel.setText(repeated + (repeated == 1 ? " senha repetida" : " senhas repetidas")
+                + " · " + weak + (weak == 1 ? " fraca" : " fracas"));
+        healthLabel.setVisibility(View.VISIBLE);
+    }
+
+    private boolean isRepeated(VaultEntry entry) {
+        Integer count = passwordCounts.get(entry.password);
+        return entry.password.length() > 0 && count != null && count > 1;
+    }
+
+    private static boolean isWeak(VaultEntry entry) {
+        return entry.password.length() > 0 && PasswordStrength.score(entry.password) <= 1;
+    }
+
+    private TextView badge(String label) {
+        TextView view = text(label, 11, Color.rgb(40, 28, 10));
+        view.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        view.setPadding(dp(8), dp(3), dp(8), dp(3));
+        GradientDrawable shape = new GradientDrawable();
+        shape.setColor(Color.rgb(255, 207, 101));
+        shape.setCornerRadius(dp(10));
+        view.setBackground(shape);
+        return view;
+    }
+
+    private void updateStrength(TextView label, String password) {
+        label.setText(password.length() == 0 ? "" : "Força: " + PasswordStrength.label(PasswordStrength.score(password)));
+    }
+
+    private void countAccess(VaultEntry entry) {
+        try {
+            store.recordAccess(entry);
+        } catch (Exception error) {
+            showError("Não foi possível registrar o acesso", error);
+        }
+    }
+
+    private boolean hasSameAccount(String site, String username) {
+        for (VaultEntry entry : store.getEntries()) {
+            if (entry.site.trim().equalsIgnoreCase(site.trim())
+                    && entry.username.trim().equalsIgnoreCase(username.trim())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Diálogo de geração: tamanho 8 a 40, classes de caracteres e prévia. */
+    private void showGenerator(final EditText target) {
+        LinearLayout body = vertical(8);
+        final TextView preview = text("", 18, Color.rgb(18, 32, 54));
+        preview.setTypeface(Typeface.MONOSPACE, Typeface.NORMAL);
+        preview.setTextIsSelectable(true);
+        final TextView lengthLabel = text("", 14, Color.rgb(91, 105, 126));
+        final SeekBar length = new SeekBar(this);
+        length.setMax(40 - PasswordGenerator.MIN_LENGTH);
+        length.setProgress(20 - PasswordGenerator.MIN_LENGTH);
+        final CheckBox upper = new CheckBox(this);
+        upper.setText("Maiúsculas");
+        upper.setChecked(true);
+        final CheckBox digits = new CheckBox(this);
+        digits.setText("Números");
+        digits.setChecked(true);
+        final CheckBox symbols = new CheckBox(this);
+        symbols.setText("Símbolos");
+        symbols.setChecked(true);
+        final SecureRandom random = new SecureRandom();
+        final Runnable refresh = new Runnable() {
+            @Override
+            public void run() {
+                int size = PasswordGenerator.MIN_LENGTH + length.getProgress();
+                lengthLabel.setText("Tamanho: " + size);
+                preview.setText(PasswordGenerator.generate(random, size,
+                        upper.isChecked(), digits.isChecked(), symbols.isChecked()));
+            }
+        };
+        length.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
+                refresh.run();
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar bar) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar bar) {
+            }
+        });
+        CompoundButton.OnCheckedChangeListener recheck = new CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(CompoundButton button, boolean checked) {
+                refresh.run();
+            }
+        };
+        upper.setOnCheckedChangeListener(recheck);
+        digits.setOnCheckedChangeListener(recheck);
+        symbols.setOnCheckedChangeListener(recheck);
+        body.addView(preview);
+        body.addView(lengthLabel, marginParams(0, 8, 0, 0));
+        body.addView(length, marginParams(0, 4, 0, 0));
+        body.addView(upper);
+        body.addView(digits);
+        body.addView(symbols);
+
+        final AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Gerar senha")
+                .setView(body)
+                .setNegativeButton("Cancelar", null)
+                .setNeutralButton("Gerar outra", null)
+                .setPositiveButton("Usar esta", null)
+                .create();
+        dialog.setOnShowListener(new DialogInterface.OnShowListener() {
+            @Override
+            public void onShow(DialogInterface shown) {
+                dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View view) {
+                        refresh.run();
+                    }
+                });
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View view) {
+                        target.setText(preview.getText().toString());
+                        dialog.dismiss();
+                    }
+                });
+            }
+        });
+        refresh.run();
+        secure(dialog);
+        dialog.show();
     }
 
     private void copyFromEntry(String label, VaultEntry entry, String value) {
