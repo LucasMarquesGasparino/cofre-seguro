@@ -1,8 +1,6 @@
 package com.cofreseguro;
 
-import android.content.ContentResolver;
 import android.content.Context;
-import android.net.Uri;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -348,40 +346,99 @@ final class VaultStore {
         entries.addAll(originals);
     }
 
-    /** Importação antiga (arquivo cifrado com a chave local). Substituída na próxima fase. */
-    void exportTo(ContentResolver resolver, Uri destination) throws Exception {
-        if (!vaultFile.exists()) {
-            save();
-        }
-        try (InputStream input = new FileInputStream(vaultFile);
-             OutputStream output = resolver.openOutputStream(destination, "w")) {
-            if (output == null) {
-                throw new IllegalStateException("Não foi possível abrir o destino");
-            }
-            copy(input, output);
+    // ---- Backup portátil protegido por senha (formato bolsa-hermione-backup-v1) ----
+
+    static final class ParsedBackup {
+        final List<VaultEntry> entries;
+        final long exportedAt;
+
+        ParsedBackup(List<VaultEntry> entries, long exportedAt) {
+            this.entries = entries;
+            this.exportedAt = exportedAt;
         }
     }
 
-    void importFrom(ContentResolver resolver, Uri source) throws Exception {
-        String packedText;
-        try (InputStream input = resolver.openInputStream(source)) {
-            if (input == null) {
-                throw new IllegalStateException("Não foi possível abrir o arquivo");
-            }
-            packedText = new String(readAll(input), StandardCharsets.UTF_8);
+    private static final String LEGACY_MESSAGE = "Este arquivo é um backup da versão antiga, preso à chave "
+            + "da instalação em que foi criado. Depois de reinstalar o app ele não pode mais ser aberto.";
+
+    /** Texto claro do backup. Chamar na thread da UI, com a bolsa carregada. */
+    String buildBackupPlaintext() throws JSONException {
+        requireLoaded();
+        JSONObject root = new JSONObject();
+        root.put("version", 1);
+        root.put("exportedAt", System.currentTimeMillis());
+        root.put("app", "Bolsa da Hermione");
+        JSONArray array = new JSONArray();
+        for (VaultEntry entry : entries) {
+            array.put(entry.toJson());
         }
-        String clearText = crypto.decrypt(packedText);
-        JSONObject root = new JSONObject(clearText);
+        root.put("entries", array);
+        return root.toString();
+    }
+
+    /** Cifra o texto com a senha do backup. Pode demorar: chamar fora da UI. */
+    static String sealBackup(String plaintext, char[] password) throws Exception {
+        BackupCrypto.Sealed sealed = BackupCrypto.seal(password,
+                plaintext.getBytes(StandardCharsets.UTF_8), BackupCrypto.DEFAULT_ITERATIONS);
+        JSONObject packed = new JSONObject();
+        packed.put("format", BackupCrypto.FORMAT);
+        packed.put("kdf", BackupCrypto.KDF);
+        packed.put("iterations", sealed.iterations);
+        packed.put("salt", sealed.salt);
+        packed.put("iv", sealed.iv);
+        packed.put("data", sealed.data);
+        packed.put("note", "Backup da Bolsa da Hermione. Abra no app em Backup › Restaurar e informe a senha do backup.");
+        return packed.toString();
+    }
+
+    /** "backup-v1", "legacy" (formato local antigo) ou "unknown". */
+    static String detectFormat(String text) {
+        try {
+            String format = new JSONObject(text).optString("format", "");
+            if (BackupCrypto.FORMAT.equals(format)) {
+                return "backup-v1";
+            }
+            if ("cofre-seguro-aes-gcm-v1".equals(format)) {
+                return "legacy";
+            }
+        } catch (JSONException error) {
+            return "unknown";
+        }
+        return "unknown";
+    }
+
+    /** Abre um backup portátil. Pode demorar (PBKDF2): chamar fora da UI. */
+    static ParsedBackup openBackup(String text, char[] password) throws Exception {
+        JSONObject packed = new JSONObject(text);
+        if (!BackupCrypto.FORMAT.equals(packed.optString("format", ""))) {
+            throw new BackupCrypto.BackupFormatException("Formato de backup desconhecido");
+        }
+        byte[] plain = BackupCrypto.open(password, packed.getInt("iterations"),
+                packed.getString("salt"), packed.getString("iv"), packed.getString("data"));
+        JSONObject root = new JSONObject(new String(plain, StandardCharsets.UTF_8));
+        return new ParsedBackup(parseEntries(root), root.optLong("exportedAt", 0));
+    }
+
+    /** Abre um arquivo do formato local antigo (só funciona na mesma instalação). */
+    ParsedBackup openLegacy(String text) {
+        try {
+            JSONObject root = new JSONObject(crypto.decrypt(text));
+            return new ParsedBackup(parseEntries(root), root.optLong("updatedAt", 0));
+        } catch (Exception error) {
+            throw new IllegalStateException(LEGACY_MESSAGE);
+        }
+    }
+
+    private static List<VaultEntry> parseEntries(JSONObject root) throws JSONException {
         if (root.optInt("version", 1) != 1 || root.optJSONArray("entries") == null) {
-            throw new SecurityException("Arquivo de cofre inválido");
+            throw new JSONException("Backup sem registros");
         }
         JSONArray array = root.getJSONArray("entries");
+        ArrayList<VaultEntry> result = new ArrayList<>();
         for (int i = 0; i < array.length(); i++) {
-            VaultEntry.fromJson(array.getJSONObject(i));
+            result.add(VaultEntry.fromJson(array.getJSONObject(i)));
         }
-        safetyCopyBeforeImport();
-        writeAtomically(packedText);
-        load();
+        return result;
     }
 
     /**

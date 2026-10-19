@@ -10,6 +10,7 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -31,6 +32,9 @@ import android.view.inputmethod.InputMethodManager;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.AutoCompleteTextView;
+import android.widget.CheckBox;
+import android.widget.CompoundButton;
+import android.widget.ProgressBar;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -41,7 +45,19 @@ import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONException;
+
+import java.io.ByteArrayOutputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
 import java.text.SimpleDateFormat;
+import java.util.Arrays;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -54,8 +70,11 @@ import java.util.concurrent.Executor;
 
 public class MainActivity extends android.app.Activity {
     private static final int REQUEST_CREDENTIAL = 4101;
-    private static final int REQUEST_EXPORT = 4102;
-    private static final int REQUEST_IMPORT = 4103;
+    private static final int REQUEST_BACKUP_EXPORT = 4102;
+    private static final int REQUEST_RESTORE = 4103;
+    private static final int REQUEST_CSV = 4104;
+    private static final int MAX_BACKUP_BYTES = 20 * 1024 * 1024;
+    private static final int MAX_CSV_BYTES = 5 * 1024 * 1024;
     private static final int SORT_ALPHABETICAL = 0;
     private static final int SORT_ACCESS = 1;
     private static final int SORT_DUPLICATES = 2;
@@ -72,6 +91,14 @@ public class MainActivity extends android.app.Activity {
     private VaultStore store;
     private KeyguardManager keyguardManager;
     private CancellationSignal cancelSignal;
+    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private SharedPreferences prefs;
+    private String pendingExportText;
+    private boolean recoveryMode;
+    private LinearLayout reminderBand;
+    private TextView reminderText;
+    private Button lockedSecondaryButton;
+    private Button lockedTertiaryButton;
 
     private FrameLayout root;
     private ScrollView scrollView;
@@ -101,6 +128,7 @@ public class MainActivity extends android.app.Activity {
         getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE,
                 WindowManager.LayoutParams.FLAG_SECURE);
         keyguardManager = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+        prefs = getSharedPreferences("prefs", MODE_PRIVATE);
         store = new VaultStore(this);
         buildUi();
         uiReady = true;
@@ -118,7 +146,7 @@ public class MainActivity extends android.app.Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        if (uiReady && !unlocked && !authInProgress && autoPromptAllowed) {
+        if (uiReady && !unlocked && !authInProgress && autoPromptAllowed && !recoveryMode) {
             handler.postDelayed(new Runnable() {
                 @Override
                 public void run() {
@@ -143,6 +171,7 @@ public class MainActivity extends android.app.Activity {
             cancelSignal = null;
         }
         handler.removeCallbacksAndMessages(null);
+        worker.shutdownNow();
         if (store != null) {
             store.clearMemory();
         }
@@ -202,25 +231,33 @@ public class MainActivity extends android.app.Activity {
             }
         });
         actionRow.addView(addButton, new LinearLayout.LayoutParams(0, dp(48), 1));
-        Button exportButton = button("Exportar", Color.rgb(49, 39, 83), Color.rgb(232, 222, 255));
-        exportButton.setBackground(borderBackground(Color.rgb(49, 39, 83), Color.rgb(105, 82, 151), 12));
-        exportButton.setOnClickListener(new View.OnClickListener() {
+        Button backupButton = button("Backup", Color.rgb(49, 39, 83), Color.rgb(232, 222, 255));
+        backupButton.setBackground(borderBackground(Color.rgb(49, 39, 83), Color.rgb(105, 82, 151), 12));
+        backupButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                exportVault();
+                showBackupMenu();
             }
         });
-        actionRow.addView(exportButton, new LinearLayout.LayoutParams(0, dp(48), 1));
-        Button importButton = button("Importar", Color.rgb(49, 39, 83), Color.rgb(232, 222, 255));
-        importButton.setBackground(borderBackground(Color.rgb(49, 39, 83), Color.rgb(105, 82, 151), 12));
-        importButton.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                importVault();
-            }
-        });
-        actionRow.addView(importButton, new LinearLayout.LayoutParams(0, dp(48), 1));
+        actionRow.addView(backupButton, new LinearLayout.LayoutParams(0, dp(48), 1));
         content.addView(actionRow, marginParams(0, 22, 0, 0));
+
+        reminderBand = vertical(8);
+        reminderBand.setBackground(borderBackground(Color.rgb(58, 40, 98), Color.rgb(255, 215, 112), 12));
+        reminderBand.setPadding(dp(14), dp(12), dp(14), dp(12));
+        reminderText = text("", 14, Color.rgb(255, 244, 211));
+        reminderBand.addView(reminderText);
+        Button reminderAction = button("Fazer backup agora", Color.rgb(111, 62, 186), Color.WHITE);
+        reminderAction.setBackground(borderBackground(Color.rgb(111, 62, 186), Color.rgb(206, 158, 255), 12));
+        reminderAction.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                showExportDialog();
+            }
+        });
+        reminderBand.addView(reminderAction, marginParams(0, 8, 0, 0));
+        reminderBand.setVisibility(View.GONE);
+        content.addView(reminderBand, marginParams(0, 14, 0, 0));
 
         LinearLayout listHeader = horizontal(0);
         listHeader.setGravity(Gravity.CENTER_VERTICAL);
@@ -305,6 +342,14 @@ public class MainActivity extends android.app.Activity {
                 requestUnlock();
             }
         });
+        lockedSecondaryButton = button("", Color.rgb(55, 40, 92), Color.rgb(255, 215, 112));
+        lockedSecondaryButton.setBackground(borderBackground(Color.rgb(55, 40, 92), Color.rgb(105, 82, 151), 12));
+        lockedSecondaryButton.setVisibility(View.GONE);
+        lockedOverlay.addView(lockedSecondaryButton, marginedFullWidth(10, 50));
+        lockedTertiaryButton = button("", Color.rgb(55, 40, 92), Color.rgb(232, 222, 255));
+        lockedTertiaryButton.setBackground(borderBackground(Color.rgb(55, 40, 92), Color.rgb(105, 82, 151), 12));
+        lockedTertiaryButton.setVisibility(View.GONE);
+        lockedOverlay.addView(lockedTertiaryButton, marginedFullWidth(10, 50));
         root.addView(lockedOverlay, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
         setContentView(root);
@@ -402,17 +447,57 @@ public class MainActivity extends android.app.Activity {
         cancelSignal = null;
         try {
             store.load();
-            unlocked = true;
-            scrollView.setVisibility(View.VISIBLE);
-            lockedOverlay.setVisibility(View.GONE);
-            sortSpinner.setEnabled(true);
-            renderVault();
         } catch (Exception error) {
             unlocked = false;
-            showLocked("Não foi possível abrir o cofre",
-                    "O arquivo pode estar corrompido ou a chave do Android foi redefinida.", false);
-            showError("Falha ao abrir o cofre", error);
+            recoveryMode = true;
+            showRecovery();
+            return;
         }
+        recoveryMode = false;
+        finishUnlock();
+        if (store.consumeRecoveredFlag()) {
+            showMessage("Bolsa recuperada",
+                    "O arquivo principal estava danificado; a cópia anterior foi recuperada.");
+        }
+    }
+
+    private void finishUnlock() {
+        unlocked = true;
+        authInProgress = false;
+        scrollView.setVisibility(View.VISIBLE);
+        lockedOverlay.setVisibility(View.GONE);
+        sortSpinner.setEnabled(true);
+        renderVault();
+    }
+
+    private void showRecovery() {
+        showLocked("Não foi possível abrir a bolsa",
+                "O arquivo pode estar danificado. Tente de novo, restaure um backup ou comece uma bolsa nova. "
+                        + "O arquivo ilegível nunca é apagado.", false);
+        lockedButton.setText("Tentar de novo");
+        lockedButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                recoveryMode = false;
+                unlockAndLoad();
+            }
+        });
+        lockedSecondaryButton.setText("Restaurar de um backup");
+        lockedSecondaryButton.setVisibility(View.VISIBLE);
+        lockedSecondaryButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                startRestore();
+            }
+        });
+        lockedTertiaryButton.setText("Começar bolsa nova");
+        lockedTertiaryButton.setVisibility(View.VISIBLE);
+        lockedTertiaryButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                confirmFreshStart();
+            }
+        });
     }
 
     private void lockAndHide() {
@@ -464,6 +549,10 @@ public class MainActivity extends android.app.Activity {
                 }
             }
         });
+        if (lockedSecondaryButton != null) {
+            lockedSecondaryButton.setVisibility(View.GONE);
+            lockedTertiaryButton.setVisibility(View.GONE);
+        }
         scrollView.setVisibility(View.INVISIBLE);
         lockedOverlay.setVisibility(View.VISIBLE);
     }
@@ -508,6 +597,7 @@ public class MainActivity extends android.app.Activity {
             return;
         }
         listContainer.removeAllViews();
+        updateReminder();
         ArrayList<VaultEntry> allEntries = new ArrayList<>(store.getEntries());
         updateSearchVisibility(allEntries.size());
         String query = searchField == null ? "" : searchField.getText().toString().trim();
@@ -518,14 +608,15 @@ public class MainActivity extends android.app.Activity {
             countLabel.setText(entries.size() + " de " + allEntries.size() + " registros");
         }
         if (entries.isEmpty()) {
-            String emptyMessage = query.length() == 0
-                    ? "Sua bolsa está vazia.\nAdicione o primeiro acesso acima."
-                    : "Nenhum registro combina com essa busca.";
-            TextView empty = text(emptyMessage, 16, Color.rgb(220, 211, 242));
-            empty.setGravity(Gravity.CENTER);
-            empty.setPadding(dp(12), dp(44), dp(12), dp(44));
-            listContainer.addView(empty, new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, -2));
+            if (query.length() == 0) {
+                renderEmptyState();
+            } else {
+                TextView empty = text("Nenhum registro combina com essa busca.", 16, Color.rgb(220, 211, 242));
+                empty.setGravity(Gravity.CENTER);
+                empty.setPadding(dp(12), dp(44), dp(12), dp(44));
+                listContainer.addView(empty, new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT, -2));
+            }
             return;
         }
 
@@ -833,6 +924,7 @@ public class MainActivity extends android.app.Activity {
                                 values.updatedAt = System.currentTimeMillis();
                                 store.update(entry, values);
                             }
+                            markDirty();
                             renderVault();
                             shown.dismiss();
                             Toast.makeText(MainActivity.this, "Registro salvo", Toast.LENGTH_SHORT).show();
@@ -865,6 +957,7 @@ public class MainActivity extends android.app.Activity {
                         }
                         try {
                             store.remove(entry);
+                            markDirty();
                             renderVault();
                             if (entryDialog != null) {
                                 entryDialog.dismiss();
@@ -879,31 +972,753 @@ public class MainActivity extends android.app.Activity {
         confirm.show();
     }
 
-    private void exportVault() {
-        if (!vaultReady()) {
-            return;
-        }
-        try {
-            store.save();
-            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-            intent.setType("application/json");
-            intent.putExtra(Intent.EXTRA_TITLE, "cofre-seguro-backup.enc.json");
-            filePickerOpen = true;
-            startActivityForResult(intent, REQUEST_EXPORT);
-        } catch (Exception error) {
-            showError("Falha ao preparar a exportação", error);
+    // ---- Tarefas em segundo plano (PBKDF2, leitura e gravação de arquivos) ----
+
+    private interface Work<T> {
+        T run() throws Exception;
+    }
+
+    private interface Done<T> {
+        void done(T result, Exception error);
+    }
+
+    private static final class TooLargeException extends Exception {
+        TooLargeException() {
+            super("Arquivo grande demais.");
         }
     }
 
-    private void importVault() {
+    private static final class LoadedFile {
+        final String text;
+        final String format;
+
+        LoadedFile(String text, String format) {
+            this.text = text;
+            this.format = format;
+        }
+    }
+
+    private <T> void inBackground(final String progress, final Work<T> work, final Done<T> done) {
+        final AlertDialog[] busy = new AlertDialog[1];
+        if (progress != null) {
+            LinearLayout body = horizontal(14);
+            body.setGravity(Gravity.CENTER_VERTICAL);
+            body.setPadding(dp(20), dp(18), dp(20), dp(18));
+            body.addView(new ProgressBar(this));
+            body.addView(text(progress, 15, Color.rgb(18, 32, 54)), new LinearLayout.LayoutParams(-2, -2));
+            AlertDialog dialog = new AlertDialog.Builder(this).setView(body).setCancelable(false).create();
+            secure(dialog);
+            dialog.show();
+            busy[0] = dialog;
+        }
+        worker.execute(new Runnable() {
+            @Override
+            public void run() {
+                T value = null;
+                Exception failure = null;
+                try {
+                    value = work.run();
+                } catch (Exception error) {
+                    failure = error;
+                } catch (OutOfMemoryError error) {
+                    failure = new TooLargeException();
+                }
+                final T finalValue = value;
+                final Exception finalFailure = failure;
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (busy[0] != null && busy[0].isShowing()) {
+                            busy[0].dismiss();
+                        }
+                        if (isFinishing() || isDestroyed()) {
+                            return;
+                        }
+                        done.done(finalValue, finalFailure);
+                    }
+                });
+            }
+        });
+    }
+
+    private String friendlyMessage(Exception error) {
+        if (error instanceof BackupCrypto.WrongPasswordException) {
+            return "Senha incorreta ou arquivo alterado.";
+        }
+        if (error instanceof BackupCrypto.BackupFormatException || error instanceof JSONException) {
+            return "Arquivo inválido ou incompleto.";
+        }
+        if (error instanceof TooLargeException) {
+            return "Arquivo grande demais.";
+        }
+        if (error instanceof SecurityException) {
+            return "Sem permissão para acessar o arquivo.";
+        }
+        if (error instanceof IOException) {
+            return "Não foi possível ler ou gravar o arquivo.";
+        }
+        if (error instanceof GeneralSecurityException) {
+            return "Não foi possível proteger ou abrir o backup.";
+        }
+        String message = error.getMessage();
+        return message == null || message.length() == 0 ? "Tente novamente." : message;
+    }
+
+    private void lockedNotice() {
+        Toast.makeText(this, "A bolsa foi bloqueada durante a operação. Desbloqueie e repita.",
+                Toast.LENGTH_LONG).show();
+    }
+
+    private void markDirty() {
+        prefs.edit().putBoolean("backupDirty", true).apply();
+    }
+
+    private String formatDate(long millis) {
+        return new SimpleDateFormat("dd/MM/yyyy", Locale.getDefault()).format(new Date(millis));
+    }
+
+    private String lastBackupLabel() {
+        long last = prefs.getLong("lastBackupAt", 0);
+        return last == 0 ? "Nenhum backup feito ainda."
+                : "Último backup: " + new SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault())
+                .format(new Date(last));
+    }
+
+    private void updateReminder() {
+        if (reminderBand == null || store == null) {
+            return;
+        }
+        long last = prefs.getLong("lastBackupAt", 0);
+        boolean dirty = prefs.getBoolean("backupDirty", false);
+        boolean show = vaultReady() && store.getEntries().size() > 0 && (last == 0 || dirty);
+        if (!show) {
+            reminderBand.setVisibility(View.GONE);
+            return;
+        }
+        reminderText.setText(last == 0
+                ? "Você ainda não tem backup protegido por senha. Sem ele, desinstalar o app ou trocar de aparelho apaga suas senhas."
+                : "Há alterações desde o último backup (" + formatDate(last) + ").");
+        reminderBand.setVisibility(View.VISIBLE);
+    }
+
+    private void renderEmptyState() {
+        LinearLayout box = vertical(12);
+        box.setPadding(dp(12), dp(36), dp(12), dp(36));
+        TextView message = text("Sua bolsa está vazia.\nAdicione a primeira senha ou restaure um backup.",
+                16, Color.rgb(220, 211, 242));
+        message.setGravity(Gravity.CENTER);
+        box.addView(message);
+        Button add = button("Adicionar primeira senha", Color.rgb(111, 62, 186), Color.WHITE);
+        add.setBackground(borderBackground(Color.rgb(111, 62, 186), Color.rgb(206, 158, 255), 12));
+        add.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                showEntryEditor(null);
+            }
+        });
+        box.addView(add, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
+        Button restore = button("Restaurar backup", Color.rgb(49, 39, 83), Color.rgb(232, 222, 255));
+        restore.setBackground(borderBackground(Color.rgb(49, 39, 83), Color.rgb(105, 82, 151), 12));
+        restore.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                startRestore();
+            }
+        });
+        box.addView(restore, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
+        listContainer.addView(box, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, -2));
+    }
+
+    private void showBackupMenu() {
+        if (!vaultReady()) {
+            return;
+        }
+        LinearLayout body = vertical(10);
+        body.addView(text(lastBackupLabel(), 14, Color.rgb(220, 211, 242)));
+        final AlertDialog[] holder = new AlertDialog[1];
+        Button exportItem = button("Exportar backup protegido por senha", Color.rgb(111, 62, 186), Color.WHITE);
+        exportItem.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                holder[0].dismiss();
+                showExportDialog();
+            }
+        });
+        body.addView(exportItem, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
+        Button restoreItem = button("Restaurar backup", Color.rgb(49, 39, 83), Color.rgb(232, 222, 255));
+        restoreItem.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                holder[0].dismiss();
+                startRestore();
+            }
+        });
+        body.addView(restoreItem, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
+        Button csvItem = button("Importar lista CSV (Chrome, Google, Bitwarden…)",
+                Color.rgb(49, 39, 83), Color.rgb(232, 222, 255));
+        csvItem.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                holder[0].dismiss();
+                startCsvImport();
+            }
+        });
+        body.addView(csvItem, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Backup")
+                .setView(body)
+                .setNegativeButton("Fechar", null)
+                .create();
+        holder[0] = dialog;
+        secure(dialog);
+        dialog.show();
+    }
+
+    private EditText passwordField(String hint) {
+        return editField(hint, "", true);
+    }
+
+    private static char[] charsOf(EditText field) {
+        int length = field.getText().length();
+        char[] chars = new char[length];
+        field.getText().getChars(0, length, chars, 0);
+        return chars;
+    }
+
+    private static void setPasswordVisible(EditText field, boolean visible) {
+        field.setInputType(visible
+                ? InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                : InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        field.setSelection(field.getText().length());
+    }
+
+    private void showExportDialog() {
+        if (!vaultReady()) {
+            return;
+        }
+        LinearLayout form = vertical(8);
+        final EditText password = passwordField("Senha do backup (mínimo 8 caracteres)");
+        final EditText confirm = passwordField("Repita a senha");
+        final TextView strength = text("Força: Muito fraca", 13, Color.rgb(220, 211, 242));
+        password.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence text, int start, int count, int after) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence text, int start, int before, int count) {
+            }
+
+            @Override
+            public void afterTextChanged(Editable editable) {
+                strength.setText("Força: " + PasswordStrength.label(PasswordStrength.score(editable.toString())));
+            }
+        });
+        CheckBox reveal = new CheckBox(this);
+        reveal.setText("Mostrar senha");
+        reveal.setTextColor(Color.rgb(220, 211, 242));
+        reveal.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(CompoundButton button, boolean checked) {
+                setPasswordVisible(password, checked);
+                setPasswordVisible(confirm, checked);
+            }
+        });
+        TextView warning = text("Guarde essa senha: sem ela o backup não pode ser aberto, nem por você.",
+                13, Color.rgb(255, 215, 112));
+        form.addView(password);
+        form.addView(confirm, marginParams(0, 10, 0, 0));
+        form.addView(strength, marginParams(0, 6, 0, 0));
+        form.addView(reveal);
+        form.addView(warning, marginParams(0, 12, 0, 0));
+
+        final AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Exportar backup")
+                .setView(form)
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Criar backup", null)
+                .create();
+        dialog.setOnShowListener(new DialogInterface.OnShowListener() {
+            @Override
+            public void onShow(DialogInterface shown) {
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View view) {
+                        if (password.getText().length() < 8) {
+                            password.setError("Use pelo menos 8 caracteres");
+                            return;
+                        }
+                        if (!password.getText().toString().equals(confirm.getText().toString())) {
+                            confirm.setError("As senhas não conferem");
+                            return;
+                        }
+                        char[] chars = charsOf(password);
+                        password.setText("");
+                        confirm.setText("");
+                        dialog.dismiss();
+                        sealBackupWithPassword(chars);
+                    }
+                });
+            }
+        });
+        secure(dialog);
+        dialog.show();
+    }
+
+    private void sealBackupWithPassword(final char[] password) {
+        final String plain;
+        try {
+            plain = store.buildBackupPlaintext();
+        } catch (Exception error) {
+            Arrays.fill(password, '\0');
+            showError("Não foi possível preparar o backup", error);
+            return;
+        }
+        inBackground("Protegendo o backup…", new Work<String>() {
+            @Override
+            public String run() throws Exception {
+                try {
+                    return VaultStore.sealBackup(plain, password);
+                } finally {
+                    Arrays.fill(password, '\0');
+                }
+            }
+        }, new Done<String>() {
+            @Override
+            public void done(String result, Exception error) {
+                if (error != null) {
+                    showError("Não foi possível proteger o backup", error);
+                    return;
+                }
+                pendingExportText = result;
+                startExportPicker();
+            }
+        });
+    }
+
+    private void startExportPicker() {
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("application/json");
+        intent.putExtra(Intent.EXTRA_TITLE, "bolsa-da-hermione-backup-"
+                + new SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).format(new Date()) + ".json");
+        filePickerOpen = true;
+        startActivityForResult(intent, REQUEST_BACKUP_EXPORT);
+    }
+
+    private OutputStream openForWrite(Uri uri) throws IOException {
+        OutputStream output = null;
+        try {
+            output = getContentResolver().openOutputStream(uri, "wt");
+        } catch (IllegalArgumentException | FileNotFoundException error) {
+            output = null;
+        }
+        if (output == null) {
+            output = getContentResolver().openOutputStream(uri, "w");
+        }
+        if (output == null) {
+            throw new IOException("Não foi possível abrir o destino");
+        }
+        return output;
+    }
+
+    /** 0 = conferido, 1 = não foi possível ler de volta, 2 = diferente do gravado. */
+    private int verifyBackup(Uri uri, byte[] expected) {
+        try (InputStream input = getContentResolver().openInputStream(uri)) {
+            if (input == null) {
+                return 1;
+            }
+            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+            byte[] chunk = new byte[8192];
+            int count;
+            while ((count = input.read(chunk)) != -1) {
+                buffer.write(chunk, 0, count);
+            }
+            return Arrays.equals(buffer.toByteArray(), expected) ? 0 : 2;
+        } catch (IOException | RuntimeException error) {
+            return 1;
+        }
+    }
+
+    private void writeBackupFile(final Uri uri, final String text) {
+        final byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        inBackground("Gravando o backup…", new Work<Integer>() {
+            @Override
+            public Integer run() throws Exception {
+                OutputStream output = openForWrite(uri);
+                try {
+                    output.write(bytes);
+                    output.flush();
+                } finally {
+                    output.close();
+                }
+                return verifyBackup(uri, bytes);
+            }
+        }, new Done<Integer>() {
+            @Override
+            public void done(Integer result, Exception error) {
+                if (error != null) {
+                    showError("Não foi possível salvar o backup", error);
+                    return;
+                }
+                if (result == 2) {
+                    showMessage("Backup não confere", "O arquivo salvo não confere. Tente outro local.");
+                    return;
+                }
+                prefs.edit()
+                        .putLong("lastBackupAt", System.currentTimeMillis())
+                        .putBoolean("backupDirty", false)
+                        .apply();
+                Toast.makeText(MainActivity.this, result == 0
+                        ? "Backup salvo e conferido"
+                        : "Backup salvo (não foi possível conferir a leitura)", Toast.LENGTH_LONG).show();
+                updateReminder();
+            }
+        });
+    }
+
+    private String readText(Uri uri, int limit) throws Exception {
+        InputStream input = getContentResolver().openInputStream(uri);
+        if (input == null) {
+            throw new IOException("Não foi possível abrir o arquivo");
+        }
+        try {
+            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+            byte[] chunk = new byte[8192];
+            int count;
+            while ((count = input.read(chunk)) != -1) {
+                buffer.write(chunk, 0, count);
+                if (buffer.size() > limit) {
+                    throw new TooLargeException();
+                }
+            }
+            return new String(buffer.toByteArray(), StandardCharsets.UTF_8);
+        } finally {
+            input.close();
+        }
+    }
+
+    private void startRestore() {
+        if (!vaultReady() && !recoveryMode) {
+            return;
+        }
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        filePickerOpen = true;
+        startActivityForResult(intent, REQUEST_RESTORE);
+    }
+
+    private void readAndDetect(final Uri uri) {
+        inBackground("Lendo o arquivo…", new Work<LoadedFile>() {
+            @Override
+            public LoadedFile run() throws Exception {
+                String text = readText(uri, MAX_BACKUP_BYTES);
+                return new LoadedFile(text, VaultStore.detectFormat(text));
+            }
+        }, new Done<LoadedFile>() {
+            @Override
+            public void done(LoadedFile result, Exception error) {
+                if (error != null) {
+                    showError("Não foi possível ler o arquivo", error);
+                    return;
+                }
+                handleBackupFile(result.text, result.format);
+            }
+        });
+    }
+
+    private void handleBackupFile(String text, String format) {
+        if ("backup-v1".equals(format)) {
+            askBackupPassword(text, null);
+        } else if ("legacy".equals(format)) {
+            openLegacyBackup(text);
+        } else {
+            showMessage("Arquivo não reconhecido", "Arquivo não reconhecido como backup da Bolsa da Hermione.");
+        }
+    }
+
+    private void askBackupPassword(final String text, String problem) {
+        LinearLayout form = vertical(8);
+        if (problem != null) {
+            form.addView(text(problem, 13, Color.rgb(255, 170, 170)));
+        }
+        final EditText password = passwordField("Senha do backup");
+        form.addView(password, marginParams(0, 8, 0, 0));
+        final AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Senha do backup")
+                .setView(form)
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Abrir", null)
+                .create();
+        dialog.setOnShowListener(new DialogInterface.OnShowListener() {
+            @Override
+            public void onShow(DialogInterface shown) {
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View view) {
+                        if (password.getText().length() == 0) {
+                            password.setError("Informe a senha");
+                            return;
+                        }
+                        char[] chars = charsOf(password);
+                        password.setText("");
+                        dialog.dismiss();
+                        openBackupWithPassword(text, chars);
+                    }
+                });
+            }
+        });
+        secure(dialog);
+        dialog.show();
+    }
+
+    private void openBackupWithPassword(final String text, final char[] password) {
+        inBackground("Abrindo o backup…", new Work<VaultStore.ParsedBackup>() {
+            @Override
+            public VaultStore.ParsedBackup run() throws Exception {
+                try {
+                    return VaultStore.openBackup(text, password);
+                } finally {
+                    Arrays.fill(password, '\0');
+                }
+            }
+        }, new Done<VaultStore.ParsedBackup>() {
+            @Override
+            public void done(VaultStore.ParsedBackup result, Exception error) {
+                if (error instanceof BackupCrypto.WrongPasswordException) {
+                    askBackupPassword(text, "Senha incorreta. Tente de novo.");
+                    return;
+                }
+                if (error != null) {
+                    showError("Não foi possível abrir o backup", error);
+                    return;
+                }
+                offerRestore(result);
+            }
+        });
+    }
+
+    private void openLegacyBackup(final String text) {
+        inBackground("Abrindo o backup…", new Work<VaultStore.ParsedBackup>() {
+            @Override
+            public VaultStore.ParsedBackup run() {
+                return store.openLegacy(text);
+            }
+        }, new Done<VaultStore.ParsedBackup>() {
+            @Override
+            public void done(VaultStore.ParsedBackup result, Exception error) {
+                if (error != null) {
+                    showError("Backup da versão antiga", error);
+                    return;
+                }
+                offerRestore(result);
+            }
+        });
+    }
+
+    private void offerRestore(final VaultStore.ParsedBackup backup) {
+        String when = backup.exportedAt == 0 ? "de data desconhecida" : "de " + formatDate(backup.exportedAt);
+        String message = "Backup " + when + " com " + backup.entries.size() + " registros.";
+        if (recoveryMode) {
+            AlertDialog dialog = new AlertDialog.Builder(this)
+                    .setTitle("Restaurar backup")
+                    .setMessage(message)
+                    .setPositiveButton("Restaurar", new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface dialogInterface, int which) {
+                            restoreIntoRecovery(backup.entries);
+                        }
+                    })
+                    .setNegativeButton("Cancelar", null)
+                    .create();
+            secure(dialog);
+            dialog.show();
+            return;
+        }
+        if (!vaultReady()) {
+            lockedNotice();
+            return;
+        }
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Restaurar backup")
+                .setMessage(message)
+                .setPositiveButton("Mesclar", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialogInterface, int which) {
+                        mergeBackup(backup.entries);
+                    }
+                })
+                .setNeutralButton("Substituir tudo", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialogInterface, int which) {
+                        confirmReplace(backup.entries);
+                    }
+                })
+                .setNegativeButton("Cancelar", null)
+                .create();
+        secure(dialog);
+        dialog.show();
+    }
+
+    private void confirmReplace(final List<VaultEntry> entries) {
+        if (!vaultReady()) {
+            lockedNotice();
+            return;
+        }
+        final int current = store.getEntries().size();
+        if (current == 0) {
+            replaceWith(entries);
+            return;
+        }
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Substituir tudo?")
+                .setMessage("Os " + current + " registros atuais serão trocados pelos do backup. "
+                        + "Uma cópia fica guardada no aparelho.")
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Substituir", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialogInterface, int which) {
+                        replaceWith(entries);
+                    }
+                })
+                .create();
+        secure(dialog);
+        dialog.show();
+    }
+
+    private void mergeBackup(List<VaultEntry> entries) {
+        if (!vaultReady()) {
+            lockedNotice();
+            return;
+        }
+        try {
+            VaultStore.ImportResult result = store.merge(entries);
+            markDirty();
+            renderVault();
+            Toast.makeText(this, result.added + " adicionados, " + result.updated + " atualizados, "
+                    + result.skipped + " já existiam", Toast.LENGTH_LONG).show();
+        } catch (Exception error) {
+            showError("Falha ao restaurar o backup", error);
+        }
+    }
+
+    private void replaceWith(List<VaultEntry> entries) {
+        if (!vaultReady()) {
+            lockedNotice();
+            return;
+        }
+        try {
+            store.replaceAll(entries);
+            markDirty();
+            renderVault();
+            Toast.makeText(this, "Bolsa substituída: " + entries.size() + " registros.", Toast.LENGTH_LONG).show();
+        } catch (Exception error) {
+            showError("Falha ao restaurar o backup", error);
+        }
+    }
+
+    private void restoreIntoRecovery(List<VaultEntry> entries) {
+        try {
+            store.startFresh();
+            store.replaceAll(entries);
+            recoveryMode = false;
+            markDirty();
+            finishUnlock();
+        } catch (Exception error) {
+            showError("Falha ao restaurar o backup", error);
+        }
+    }
+
+    private void confirmFreshStart() {
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Começar bolsa nova?")
+                .setMessage("O arquivo ilegível fica guardado à parte, não é apagado.")
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Começar", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialogInterface, int which) {
+                        try {
+                            store.startFresh();
+                            recoveryMode = false;
+                            finishUnlock();
+                        } catch (Exception error) {
+                            showError("Não foi possível começar uma bolsa nova", error);
+                        }
+                    }
+                })
+                .create();
+        secure(dialog);
+        dialog.show();
+    }
+
+    private void startCsvImport() {
         if (!vaultReady()) {
             return;
         }
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        intent.setType("application/json");
         intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
+                "text/*", "text/csv", "text/comma-separated-values", "application/csv"});
         filePickerOpen = true;
-        startActivityForResult(intent, REQUEST_IMPORT);
+        startActivityForResult(intent, REQUEST_CSV);
+    }
+
+    private void readCsv(final Uri uri) {
+        inBackground("Lendo a lista…", new Work<List<CsvImport.Row>>() {
+            @Override
+            public List<CsvImport.Row> run() throws Exception {
+                return CsvImport.parse(readText(uri, MAX_CSV_BYTES));
+            }
+        }, new Done<List<CsvImport.Row>>() {
+            @Override
+            public void done(final List<CsvImport.Row> rows, Exception error) {
+                if (error != null) {
+                    showError("Não foi possível importar a lista", error);
+                    return;
+                }
+                if (rows.isEmpty()) {
+                    showMessage("Lista vazia", "Nenhum registro encontrado no arquivo.");
+                    return;
+                }
+                AlertDialog dialog = new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("Importar lista CSV")
+                        .setMessage(rows.size() + " registros encontrados. Os repetidos serão ignorados.")
+                        .setNegativeButton("Cancelar", null)
+                        .setPositiveButton("Importar", new DialogInterface.OnClickListener() {
+                            @Override
+                            public void onClick(DialogInterface dialogInterface, int which) {
+                                importRows(rows);
+                            }
+                        })
+                        .create();
+                secure(dialog);
+                dialog.show();
+            }
+        });
+    }
+
+    private void importRows(List<CsvImport.Row> rows) {
+        if (!vaultReady()) {
+            lockedNotice();
+            return;
+        }
+        ArrayList<VaultEntry> entries = new ArrayList<>();
+        for (CsvImport.Row row : rows) {
+            VaultEntry entry = new VaultEntry(row.site, row.username, row.password);
+            entry.notes = row.notes;
+            entries.add(entry);
+        }
+        try {
+            VaultStore.ImportResult result = store.merge(entries);
+            markDirty();
+            renderVault();
+            showMessage("Lista importada", result.added + " adicionados, " + result.skipped
+                    + " já existiam. Apague o arquivo CSV: ele guarda senhas sem criptografia.");
+        } catch (Exception error) {
+            showError("Falha ao importar a lista", error);
+        }
     }
 
     @Override
@@ -919,26 +1734,35 @@ public class MainActivity extends android.app.Activity {
             }
             return;
         }
-        if (requestCode == REQUEST_EXPORT || requestCode == REQUEST_IMPORT) {
+        if (requestCode == REQUEST_BACKUP_EXPORT) {
             filePickerOpen = false;
-            if (resultCode == RESULT_OK && data != null && data.getData() != null && vaultReady()) {
-                try {
-                    if (requestCode == REQUEST_EXPORT) {
-                        store.exportTo(getContentResolver(), data.getData());
-                        Toast.makeText(this, "Backup criptografado exportado", Toast.LENGTH_LONG).show();
-                    } else {
-                        store.importFrom(getContentResolver(), data.getData());
-                        Toast.makeText(this, "Backup criptografado importado", Toast.LENGTH_LONG).show();
-                    }
-                    renderVault();
-                } catch (Exception error) {
-                    showError("Falha no backup criptografado", error);
-                }
-            } else if (resultCode == RESULT_OK && data != null && data.getData() != null) {
-                Toast.makeText(this, "A bolsa foi bloqueada durante a operação. Desbloqueie e repita.",
-                        Toast.LENGTH_LONG).show();
+            String text = pendingExportText;
+            pendingExportText = null;
+            if (resultCode == RESULT_OK && data != null && data.getData() != null && text != null) {
+                writeBackupFile(data.getData(), text);
+            }
+            return;
+        }
+        if (requestCode == REQUEST_RESTORE) {
+            filePickerOpen = false;
+            if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+                readAndDetect(data.getData());
+            }
+            return;
+        }
+        if (requestCode == REQUEST_CSV) {
+            filePickerOpen = false;
+            if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+                readCsv(data.getData());
             }
         }
+    }
+
+    private LinearLayout.LayoutParams marginedFullWidth(int top, int heightDp) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(heightDp));
+        params.setMargins(0, dp(top), 0, 0);
+        return params;
     }
 
     private void copyToClipboard(String label, String value) {
@@ -963,11 +1787,7 @@ public class MainActivity extends android.app.Activity {
     }
 
     private void showError(String title, Exception error) {
-        String detail = error.getMessage();
-        if (detail == null || detail.length() == 0) {
-            detail = "Verifique o armazenamento e tente novamente.";
-        }
-        showMessage(title, detail);
+        showMessage(title, friendlyMessage(error));
     }
 
     private EditText editField(String hint, String value, boolean password) {
