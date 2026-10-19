@@ -6,9 +6,11 @@ import android.app.KeyguardManager;
 import android.content.DialogInterface;
 import android.hardware.biometrics.BiometricManager;
 import android.hardware.biometrics.BiometricPrompt;
+import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.IntentFilter;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
@@ -20,6 +22,8 @@ import android.os.Bundle;
 import android.os.CancellationSignal;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PersistableBundle;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputType;
@@ -28,6 +32,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
+import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
@@ -35,6 +40,8 @@ import android.widget.AutoCompleteTextView;
 import android.widget.CheckBox;
 import android.widget.CompoundButton;
 import android.widget.ProgressBar;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -121,6 +128,32 @@ public class MainActivity extends android.app.Activity {
     private boolean resettingSearch;
     private boolean autoPromptAllowed = true;
     private int sortMode = SORT_ALPHABETICAL;
+    private long backgroundedAt;
+    private String clipboardText;
+    private BroadcastReceiver screenOffReceiver;
+
+    private static final long IDLE_LOCK_MS = 5 * 60 * 1000L;
+    private static final long FILE_PICKER_LOCK_MS = 5 * 60 * 1000L;
+    private static final long CLIPBOARD_CLEAR_MS = 30_000L;
+
+    private final Runnable lockRunnable = new Runnable() {
+        @Override
+        public void run() {
+            lockAndHide();
+        }
+    };
+    private final Runnable idleLockRunnable = new Runnable() {
+        @Override
+        public void run() {
+            lockAndHide();
+        }
+    };
+    private final Runnable clearClipRunnable = new Runnable() {
+        @Override
+        public void run() {
+            clearClipboardNow();
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -129,6 +162,18 @@ public class MainActivity extends android.app.Activity {
                 WindowManager.LayoutParams.FLAG_SECURE);
         keyguardManager = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
         prefs = getSharedPreferences("prefs", MODE_PRIVATE);
+        screenOffReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                lockAndHide();
+            }
+        };
+        IntentFilter screenOff = new IntentFilter(Intent.ACTION_SCREEN_OFF);
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(screenOffReceiver, screenOff, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(screenOffReceiver, screenOff);
+        }
         store = new VaultStore(this);
         buildUi();
         uiReady = true;
@@ -141,6 +186,80 @@ public class MainActivity extends android.app.Activity {
         if (!authInProgress && !filePickerOpen) {
             autoPromptAllowed = true;
         }
+        if (!unlocked) {
+            return;
+        }
+        if (filePickerOpen) {
+            handler.postDelayed(lockRunnable, FILE_PICKER_LOCK_MS);
+        } else if (lockTimeout() == 0) {
+            lockAndHide();
+        } else {
+            backgroundedAt = SystemClock.elapsedRealtime();
+            handler.postDelayed(lockRunnable, lockTimeout());
+        }
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        handler.removeCallbacks(lockRunnable);
+        if (unlocked && !filePickerOpen && backgroundedAt > 0
+                && SystemClock.elapsedRealtime() - backgroundedAt > lockTimeout()) {
+            lockAndHide();
+        }
+        backgroundedAt = 0;
+    }
+
+    @Override
+    public void onUserInteraction() {
+        super.onUserInteraction();
+        scheduleIdleLock();
+    }
+
+    private void scheduleIdleLock() {
+        handler.removeCallbacks(idleLockRunnable);
+        if (unlocked) {
+            handler.postDelayed(idleLockRunnable, IDLE_LOCK_MS);
+        }
+    }
+
+    private long lockTimeout() {
+        return prefs.getLong("lockTimeoutMs", 30000);
+    }
+
+    private void showSettings() {
+        final long[] values = {0, 30000, 60000, 300000};
+        final String[] labels = {"Imediatamente", "Após 30 segundos", "Após 1 minuto", "Após 5 minutos"};
+        LinearLayout body = vertical(6);
+        RadioGroup group = new RadioGroup(this);
+        final AlertDialog[] holder = new AlertDialog[1];
+        for (int i = 0; i < values.length; i++) {
+            RadioButton option = new RadioButton(this);
+            option.setText(labels[i]);
+            option.setTextColor(Color.rgb(18, 32, 54));
+            option.setId(View.generateViewId());
+            option.setChecked(values[i] == lockTimeout());
+            final long value = values[i];
+            option.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View view) {
+                    prefs.edit().putLong("lockTimeoutMs", value).apply();
+                    holder[0].dismiss();
+                }
+            });
+            group.addView(option, new RadioGroup.LayoutParams(RadioGroup.LayoutParams.MATCH_PARENT, dp(48)));
+        }
+        body.addView(group);
+        body.addView(text("A bolsa também bloqueia ao desligar a tela e após 5 minutos sem uso.",
+                13, Color.rgb(91, 105, 126)), marginParams(0, 10, 0, 0));
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Bloquear ao sair do app")
+                .setView(body)
+                .setNegativeButton("Fechar", null)
+                .create();
+        holder[0] = dialog;
+        secure(dialog);
+        dialog.show();
     }
 
     @Override
@@ -157,21 +276,22 @@ public class MainActivity extends android.app.Activity {
     }
 
     @Override
-    protected void onPause() {
-        super.onPause();
-        if (unlocked && !filePickerOpen) {
-            lockAndHide();
-        }
-    }
-
-    @Override
     protected void onDestroy() {
         if (cancelSignal != null) {
             cancelSignal.cancel();
             cancelSignal = null;
         }
+        clearClipboardNow();
         handler.removeCallbacksAndMessages(null);
         worker.shutdownNow();
+        if (screenOffReceiver != null) {
+            try {
+                unregisterReceiver(screenOffReceiver);
+            } catch (IllegalArgumentException error) {
+                // Já desregistrado.
+            }
+            screenOffReceiver = null;
+        }
         if (store != null) {
             store.clearMemory();
         }
@@ -181,6 +301,7 @@ public class MainActivity extends android.app.Activity {
     private void buildUi() {
         root = new FrameLayout(this);
         root.setBackground(magicBackground());
+        root.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
 
         scrollView = new ScrollView(this);
         scrollView.setFillViewport(true);
@@ -219,6 +340,17 @@ public class MainActivity extends android.app.Activity {
             }
         });
         header.addView(visibilityButton, new LinearLayout.LayoutParams(dp(48), dp(42)));
+        Button lockButton = button("🔒", Color.rgb(55, 40, 92), Color.rgb(255, 215, 112));
+        lockButton.setTextSize(18);
+        lockButton.setContentDescription("Bloquear agora");
+        lockButton.setBackground(borderBackground(Color.rgb(55, 40, 92), Color.rgb(105, 82, 151), 12));
+        lockButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                lockAndHide();
+            }
+        });
+        header.addView(lockButton, new LinearLayout.LayoutParams(dp(48), dp(48)));
         content.addView(header);
 
         LinearLayout actionRow = horizontal(8);
@@ -240,6 +372,15 @@ public class MainActivity extends android.app.Activity {
             }
         });
         actionRow.addView(backupButton, new LinearLayout.LayoutParams(0, dp(48), 1));
+        Button settingsButton = button("Ajustes", Color.rgb(49, 39, 83), Color.rgb(232, 222, 255));
+        settingsButton.setBackground(borderBackground(Color.rgb(49, 39, 83), Color.rgb(105, 82, 151), 12));
+        settingsButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                showSettings();
+            }
+        });
+        actionRow.addView(settingsButton, new LinearLayout.LayoutParams(0, dp(48), 1));
         content.addView(actionRow, marginParams(0, 22, 0, 0));
 
         reminderBand = vertical(8);
@@ -468,6 +609,7 @@ public class MainActivity extends android.app.Activity {
         lockedOverlay.setVisibility(View.GONE);
         sortSpinner.setEnabled(true);
         renderVault();
+        scheduleIdleLock();
     }
 
     private void showRecovery() {
@@ -501,9 +643,14 @@ public class MainActivity extends android.app.Activity {
     }
 
     private void lockAndHide() {
+        handler.removeCallbacks(lockRunnable);
+        handler.removeCallbacks(idleLockRunnable);
+        dismissAllDialogs();
+        if (!unlocked) {
+            return;
+        }
         unlocked = false;
         passwordsVisible = false;
-        dismissAllDialogs();
         if (searchField != null) {
             resettingSearch = true;
             searchField.setText("");
@@ -565,6 +712,7 @@ public class MainActivity extends android.app.Activity {
         Window window = dialog.getWindow();
         if (window != null) {
             window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE);
+            window.getDecorView().setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
         }
         openDialogs.add(dialog);
         dialog.setOnDismissListener(new DialogInterface.OnDismissListener() {
@@ -800,7 +948,7 @@ public class MainActivity extends android.app.Activity {
         copyUsername.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                copyToClipboard("Usuário", entry.username);
+                copyFromEntry("Usuário", entry, entry.username);
             }
         });
         body.addView(copyUsername, marginParams(0, 6, 0, 0));
@@ -829,7 +977,7 @@ public class MainActivity extends android.app.Activity {
         copyPassword.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                copyToClipboard("Senha", entry.password);
+                copyFromEntry("Senha", entry, entry.password);
             }
         });
         passwordActions.addView(copyPassword, new LinearLayout.LayoutParams(0, dp(46), 1));
@@ -1765,25 +1913,68 @@ public class MainActivity extends android.app.Activity {
         return params;
     }
 
+    private void copyFromEntry(String label, VaultEntry entry, String value) {
+        if (!vaultReady()) {
+            return;
+        }
+        copyToClipboard(label, value);
+        try {
+            store.recordAccess(entry);
+        } catch (Exception error) {
+            showError("Não foi possível registrar o acesso", error);
+        }
+    }
+
     private void copyToClipboard(String label, String value) {
         if (value == null || value.length() == 0) {
             Toast.makeText(this, "Esse campo está vazio", Toast.LENGTH_SHORT).show();
             return;
         }
-        final ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-        final String copied = value;
-        clipboard.setPrimaryClip(ClipData.newPlainText(label, value));
-        Toast.makeText(this, "Copiado; o conteúdo será limpo em 30 segundos", Toast.LENGTH_SHORT).show();
-        handler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (clipboard.hasPrimaryClip() && clipboard.getPrimaryClip() != null
-                        && clipboard.getPrimaryClip().getItemCount() > 0
-                        && copied.equals(clipboard.getPrimaryClip().getItemAt(0).coerceToText(MainActivity.this).toString())) {
-                    clipboard.clearPrimaryClip();
-                }
+        ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        ClipData clip = ClipData.newPlainText(label, value);
+        PersistableBundle extras = new PersistableBundle();
+        extras.putBoolean("android.content.extra.IS_SENSITIVE", true);
+        clip.getDescription().setExtras(extras);
+        clipboard.setPrimaryClip(clip);
+        clipboardText = value;
+        handler.removeCallbacks(clearClipRunnable);
+        handler.postDelayed(clearClipRunnable, CLIPBOARD_CLEAR_MS);
+        Toast.makeText(this, "Senha".equals(label)
+                ? "Senha copiada. Será apagada da área de transferência em 30 s."
+                : label + " copiado. A área de transferência será limpa em 30 s.", Toast.LENGTH_SHORT).show();
+    }
+
+    /**
+     * Em segundo plano o Android 10+ não deixa ler a área de transferência, então quando
+     * não dá para conferir a limpeza é feita mesmo assim. Se o conteúdo atual for outro
+     * texto (o usuário copiou algo depois), ele é mantido.
+     */
+    private void clearClipboardNow() {
+        if (clipboardText == null) {
+            return;
+        }
+        String copied = clipboardText;
+        clipboardText = null;
+        handler.removeCallbacks(clearClipRunnable);
+        try {
+            ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            ClipData current = null;
+            try {
+                current = clipboard.getPrimaryClip();
+            } catch (RuntimeException error) {
+                current = null;
             }
-        }, 30_000);
+            if (current == null || current.getItemCount() == 0) {
+                clipboard.clearPrimaryClip();
+                return;
+            }
+            CharSequence text = current.getItemAt(0).coerceToText(this);
+            if (text != null && copied.contentEquals(text)) {
+                clipboard.clearPrimaryClip();
+            }
+        } catch (RuntimeException error) {
+            // Sem como limpar agora; o sistema controla a área de transferência.
+        }
     }
 
     private void showError(String title, Exception error) {
@@ -1798,10 +1989,11 @@ public class MainActivity extends android.app.Activity {
         field.setSingleLine(true);
         field.setPadding(dp(14), 0, dp(14), 0);
         field.setBackground(borderBackground(Color.WHITE, Color.rgb(210, 220, 234), 12));
+        field.setImeOptions(EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
         if (password) {
             field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         } else {
-            field.setInputType(InputType.TYPE_CLASS_TEXT);
+            field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         }
         return field;
     }
@@ -1822,7 +2014,8 @@ public class MainActivity extends android.app.Activity {
         field.setThreshold(0);
         field.setPadding(dp(14), 0, dp(14), 0);
         field.setBackground(borderBackground(Color.WHITE, Color.rgb(210, 220, 234), 12));
-        field.setInputType(InputType.TYPE_CLASS_TEXT);
+        field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        field.setImeOptions(EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
 
         final ArrayAdapter<String> adapter = new ArrayAdapter<String>(this,
                 android.R.layout.simple_dropdown_item_1line, usernamesInVault());
